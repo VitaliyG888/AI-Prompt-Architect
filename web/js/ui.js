@@ -226,6 +226,7 @@ export const MODE_DESCRIPTIONS = {
 
 const STATUS_TONE = {
   ready: 'ok',
+  ready_for_synthesis: 'info',
   needs_revision: 'warn',
   awaiting_answer: 'info',
   needs_clarification: 'warn',
@@ -252,6 +253,7 @@ export const STATUS_TEXT = {
   not_started: 'не начат',
   awaiting_answer: 'ожидает ответа',
   needs_clarification: 'требует уточнения',
+  ready_for_synthesis: 'можно собирать',
   researching: 'исследуется',
   analyzing: 'анализируется',
   ready: 'готов',

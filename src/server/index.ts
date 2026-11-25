@@ -13,6 +13,7 @@ import { json, errorResponse } from './http/respond.ts';
 import { serveStatic } from './http/static.ts';
 import { assertAuthorized } from './api/helpers.ts';
 import { registerProjectRoutes } from './api/projects.ts';
+import { registerSkillRoutes } from './api/skills.ts';
 import { registerConfigRoutes } from './api/config.ts';
 import { log } from './core/logger.ts';
 import { toAppError } from './core/errors.ts';
@@ -20,6 +21,7 @@ import { toAppError } from './core/errors.ts';
 export function buildRouter(app: ReturnType<typeof createApp>): Router {
   const router = new Router();
   registerProjectRoutes(router, { app });
+  registerSkillRoutes(router, { app });
   registerConfigRoutes(router, { app });
   return router;
 }

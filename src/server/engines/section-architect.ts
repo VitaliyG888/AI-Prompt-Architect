@@ -9,7 +9,17 @@
 import type { LLMClient } from '../llm/client.ts';
 import type { ProjectRecord, SectionKey, SectionRecord } from '../domain/types.ts';
 import { MODE_POLICIES, SECTION_DEPENDENCIES, SECTION_TITLES } from '../domain/types.ts';
-import { synthesisPrompt } from '../domain/prompts.ts';
+import { synthesisPrompt, type SynthesisExample, type SynthesisSkill } from '../domain/prompts.ts';
+import { detectArchetype } from '../domain/archetypes.ts';
+import {
+  SKILL_CATEGORY_LABELS,
+  exampleIdsFor,
+  selectSkills,
+  truncateExample,
+  type PromptExample,
+  type Skill,
+} from '../domain/skills.ts';
+import { getLibraryPrompts } from '../domain/prompt-library.ts';
 import { callJson } from './llmjson.ts';
 import { heuristicQuality, normalizeQuality } from '../domain/quality.ts';
 import type { SectionRepository } from '../db/repo/sections.ts';
@@ -27,7 +37,15 @@ export interface SynthesisResult {
   openQuestions: string[];
   confidence: number;
   source: 'llm' | 'heuristic';
+  /** Скиллы, задавшие стандарт раздела (для прозрачности и экспорта). */
+  skills: Array<{ id: string; label: string; category: string }>;
+  /** Примеры из библиотеки, показанные модели. */
+  examples: Array<{ id: string; title: string }>;
 }
+
+/** Сколько скиллов и примеров показывать модели в одном разделе. */
+const MAX_SKILLS_PER_SECTION = 3;
+const MAX_EXAMPLES_PER_SECTION = 2;
 
 export interface SectionArchitectDeps {
   client: LLMClient;
@@ -55,6 +73,10 @@ export class SectionArchitect {
     const sources = this.deps.sources.list(project.id, sectionKey);
     const researchAvailable = section.research.status === 'done' && section.research.findings.length > 0;
 
+    // Скиллы и примеры подбираются детерминированно: один и тот же проект
+    // и раздел всегда дают один и тот же набор.
+    const plan = this.selectSkillPlan(project, sectionKey);
+
     try {
       const pair = synthesisPrompt({
         idea: project.idea,
@@ -71,6 +93,8 @@ export class SectionArchitect {
         sources: sources.slice(0, 6).map((source) => ({ title: source.title, url: source.url })),
         alternatives: policy.alternatives,
         previousContent: options.previousContent ?? (section.content || undefined),
+        skills: plan.skills,
+        examples: plan.examples,
       });
 
       const userContent = options.feedback
@@ -148,6 +172,7 @@ export class SectionArchitect {
         alternatives,
         decisions,
         openQuestions: strings(result.data.openQuestions),
+        flags: this.mergeSkillFlags(section.flags, plan),
         research: {
           ...section.research,
           status: researchAvailable ? 'done' : section.research.status,
@@ -165,6 +190,12 @@ export class SectionArchitect {
         openQuestions: strings(result.data.openQuestions),
         confidence: typeof result.data.confidence === 'number' ? result.data.confidence : 70,
         source: 'llm',
+        skills: plan.selected.map((skill) => ({
+          id: skill.id,
+          label: skill.label,
+          category: SKILL_CATEGORY_LABELS[skill.category],
+        })),
+        examples: plan.found.map((example) => ({ id: example.id, title: example.title })),
       };
     } catch (error) {
       const appError = toAppError(error);
@@ -172,14 +203,23 @@ export class SectionArchitect {
         section: sectionKey,
         code: appError.code,
       });
-      // Честная деградация: собираем раздел из подтверждённых требований без
-      // выдумывания. Явно помечаем, что нужна доработка моделью.
+      // Честная деградация: раздел собирается из подтверждённых требований
+      // и стандартов, без выдуманных фактов и без тупика.
+      //
+      // Раньше здесь стоял 'needs_revision'. Для пользователя это был тупик:
+      // раздел уже содержит текст, но помечен «требует пересмотра», и из этого
+      // состояния некуда идти. Теперь раздел остаётся рабочим, а факт деградации
+      // записывается явным флагом degraded:<код>, который видно в интерфейсе.
       const fallback = this.buildFallback(section);
       const updated = this.deps.sections.update(project.id, sectionKey, {
         content: fallback,
         summary: `Раздел собран из требований пользователя (модель недоступна: ${appError.code})`,
-        status: 'needs_revision',
+        status: 'ready_for_synthesis',
         quality: heuristicQuality(fallback, section.requirements),
+        flags: [
+          ...this.mergeSkillFlags(section.flags, plan),
+          `degraded:${appError.code}`,
+        ],
       });
       return {
         section: updated,
@@ -190,8 +230,76 @@ export class SectionArchitect {
         openQuestions: section.openQuestions,
         confidence: 0,
         source: 'heuristic',
+        skills: plan.selected.map((skill) => ({
+          id: skill.id,
+          label: skill.label,
+          category: SKILL_CATEGORY_LABELS[skill.category],
+        })),
+        examples: plan.found.map((example) => ({ id: example.id, title: example.title })),
       };
     }
+  }
+
+  /**
+   * Подбирает скиллы и примеры для раздела.
+   *
+   * Отбор детерминирован (см. selectSkills) и зависит от архетипа, ключа
+   * раздела и ключевых слов идеи — поэтому один и тот же проект при повторном
+   * синтезе получает тот же стандарт, а не случайный набор.
+   *
+   * Объём подсказок зависит от режима: quick не должен раздувать промт,
+   * expert получает максимум профессиональных требований.
+   */
+  private selectSkillPlan(
+    project: ProjectRecord,
+    sectionKey: SectionKey,
+  ): {
+    selected: Skill[];
+    found: PromptExample[];
+    skills: SynthesisSkill[];
+    examples: SynthesisExample[];
+  } {
+    const archetype = detectArchetype(project.idea);
+    const limits =
+      project.mode === 'quick'
+        ? { skills: 1, examples: 1 }
+        : project.mode === 'expert'
+          ? { skills: MAX_SKILLS_PER_SECTION, examples: MAX_EXAMPLES_PER_SECTION }
+          : { skills: 2, examples: MAX_EXAMPLES_PER_SECTION };
+
+    const selected = selectSkills({
+      idea: project.idea,
+      sectionKey,
+      archetype,
+      limit: limits.skills,
+    }).map((entry) => entry.skill);
+
+    const found = selected.length
+      ? getLibraryPrompts(exampleIdsFor(selected)).slice(0, limits.examples)
+      : [];
+
+    return {
+      selected,
+      found,
+      skills: selected.map((skill) => ({
+        label: skill.label,
+        categoryLabel: SKILL_CATEGORY_LABELS[skill.category],
+        guidance: skill.guidance,
+        antiPatterns: skill.antiPatterns,
+      })),
+      examples: found.map((example) => ({
+        title: example.title,
+        categoryLabel: example.categoryLabel,
+        body: truncateExample(example.body),
+      })),
+    };
+  }
+
+  /** Отмечает в разделе, какие скиллы задали стандарт (для прозрачности). */
+  private mergeSkillFlags(flags: string[], plan: { selected: Skill[] }): string[] {
+    // Старые skill-флаги снимаем, чтобы список отражал последний синтез.
+    const kept = flags.filter((flag) => !flag.startsWith('skill:'));
+    return [...new Set([...kept, ...plan.selected.map((skill) => `skill:${skill.id}`)])];
   }
 
   private buildFallback(section: SectionRecord): string {

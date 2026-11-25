@@ -22,6 +22,23 @@ import { diffVersions, exportJson, exportMarkdown, exportText } from '../src/ser
 import { SECTION_DEPENDENCIES, SECTION_KEYS, SECTION_TITLES } from '../src/server/domain/types.ts';
 import type { ProjectRecord, SectionRecord } from '../src/server/domain/types.ts';
 import type { VersionRecord } from '../src/server/db/repo/versions.ts';
+import {
+  SKILLS,
+  SKILLS_BY_ID,
+  SKILL_CATEGORY_ORDER,
+  EXAMPLE_BODY_LIMIT,
+  selectSkills,
+  exampleIdsFor,
+  truncateExample,
+} from '../src/server/domain/skills.ts';
+import {
+  PROMPT_LIBRARY_PROMPTS,
+  getLibraryPrompt,
+  getLibraryPrompts,
+  librarySummary,
+  searchLibrary,
+} from '../src/server/domain/prompt-library.ts';
+import { synthesisPrompt } from '../src/server/domain/prompts.ts';
 
 /* ─────────────────────────── JSON ─────────────────────────── */
 
@@ -245,6 +262,253 @@ test('sections: граф зависимостей ссылается тольк�
       assert.ok(SECTION_KEYS.includes(dependent), `${key} ссылается на неизвестный ${dependent}`);
     }
   }
+});
+
+/* ─────────────────────────── Архетип сайта ─────────────────────────── */
+
+test('archetypes: сайт уходит в site_builder, а не в маркетинг', () => {
+  // Раньше «лендинг» попадал в marketing_expert, и интервью спрашивало
+  // про юридические ограничения вместо типа сайта и стека.
+  assert.equal(detectArchetype('Нужен лендинг для салона красоты с записью онлайн'), 'site_builder');
+  assert.equal(detectArchetype('Многостраничный сайт студии на Tilda'), 'site_builder');
+  assert.equal(detectArchetype('Разработка сайта для интернет-магазина'), 'site_builder');
+
+  const archetype = getArchetype('site_builder');
+  const probes = Object.values(archetype.probes).flat().join(' ').toLowerCase();
+
+  // Вопросы — про сайт: тип, стек, адаптивность. Юридической части нет.
+  assert.match(probes, /лендинг|многостраничн/);
+  assert.match(probes, /конструктор|tilda|wordpress|html|react|next/);
+  assert.match(probes, /адаптивн|мобильн/);
+  assert.doesNotMatch(probes, /юридическ/);
+
+  for (const key of archetype.criticalSections) {
+    assert.ok(SECTION_KEYS.includes(key), `${key} должен быть валидным разделом`);
+  }
+});
+
+test('archetypes: ключевые слова не пересекаются между сайтом и маркетингом', () => {
+  // Маркетинговые ключи не должны содержать «лендинг»: иначе архетип
+  // определяется порядком перебора, а не смыслом задачи.
+  assert.equal(detectArchetype('Маркетинговая стратегия и воронка продаж'), 'marketing_expert');
+  assert.equal(detectArchetype('Лендинг для студии маникюра'), 'site_builder');
+});
+
+/* ─────────────────────────── Библиотека примеров ─────────────────────────── */
+
+test('library: каталог целостен и пригоден для подстановки', () => {
+  const summary = librarySummary();
+  assert.ok(summary.counts.categories >= 5, 'категорий должно быть не меньше пяти');
+  assert.equal(summary.counts.prompts, PROMPT_LIBRARY_PROMPTS.length);
+  assert.ok(summary.counts.prompts > 0);
+
+  const ids = new Set<string>();
+  for (const prompt of PROMPT_LIBRARY_PROMPTS) {
+    assert.ok(!ids.has(prompt.id), `дубликат id в библиотеке: ${prompt.id}`);
+    ids.add(prompt.id);
+    assert.ok(prompt.title.trim().length > 0, `пустой заголовок у ${prompt.id}`);
+    assert.ok(prompt.body.trim().length > 0, `пустое тело у ${prompt.id}`);
+    assert.equal(prompt.chars, prompt.body.length, `chars не совпадает с телом у ${prompt.id}`);
+    assert.ok(prompt.category.length > 0);
+  }
+
+  // Каждая категория из сводки реально содержит примеры.
+  for (const category of summary.categories) {
+    assert.ok(category.count > 0, `категория ${category.slug} пустая`);
+    assert.equal(
+      PROMPT_LIBRARY_PROMPTS.filter((prompt) => prompt.category === category.slug).length,
+      category.count,
+      `счётчик категории ${category.slug} расходится с содержимым`,
+    );
+  }
+});
+
+test('library: выборка по id и поиск работают предсказуемо', () => {
+  const first = PROMPT_LIBRARY_PROMPTS[0];
+  const found = getLibraryPrompt(first.id);
+  assert.ok(found);
+  assert.equal(found.id, first.id);
+  assert.equal(found.body, first.body);
+
+  assert.equal(getLibraryPrompt('нет-такого-примера'), null);
+  assert.deepEqual(getLibraryPrompts(['нет-такого-примера']), []);
+
+  // Порядок сохраняется, отсутствующие id пропускаются.
+  const second = PROMPT_LIBRARY_PROMPTS[1];
+  assert.deepEqual(
+    getLibraryPrompts([second.id, 'нет-такого-примера', first.id]).map((prompt) => prompt.id),
+    [second.id, first.id],
+  );
+
+  // Поиск по категории не смешивает категории.
+  const category = PROMPT_LIBRARY_PROMPTS[0].category;
+  const searched = searchLibrary({ category, limit: 5 });
+  assert.ok(searched.length > 0);
+  assert.ok(searched.every((prompt) => prompt.category === category));
+});
+
+/* ─────────────────────────── Скиллы ─────────────────────────── */
+
+test('skills: каталог целостен, идентификаторы уникальны', () => {
+  const ids = new Set<string>();
+  for (const skill of SKILLS) {
+    assert.ok(!ids.has(skill.id), `дубликат скилла: ${skill.id}`);
+    ids.add(skill.id);
+    assert.ok(skill.label.trim().length > 0, `пустая подпись у ${skill.id}`);
+    assert.ok(skill.guidance.length > 0, `нет обязательных требований у ${skill.id}`);
+    assert.ok(skill.antiPatterns.length > 0, `нет ошибок-антипаттернов у ${skill.id}`);
+    assert.ok(
+      (SKILL_CATEGORY_ORDER as readonly string[]).includes(skill.category),
+      `неизвестная категория у ${skill.id}`,
+    );
+    for (const key of skill.sections) {
+      assert.ok(SECTION_KEYS.includes(key), `${skill.id} ссылается на неизвестный раздел ${key}`);
+    }
+    assert.equal(SKILLS_BY_ID.get(skill.id)?.id, skill.id);
+  }
+
+  // Каждая категория представлена хотя бы одним скиллом.
+  for (const category of SKILL_CATEGORY_ORDER) {
+    assert.ok(SKILLS.some((skill) => skill.category === category), `категория ${category} пустая`);
+  }
+});
+
+test('skills: все exampleIds резолвятся в библиотеку', () => {
+  const missing: string[] = [];
+  for (const skill of SKILLS) {
+    for (const id of skill.exampleIds) {
+      if (!getLibraryPrompt(id)) missing.push(`${skill.id} -> ${id}`);
+    }
+  }
+  assert.deepEqual(missing, [], `примеры не найдены: ${missing.join(', ')}`);
+});
+
+test('skills: подбор детерминирован и не превышает лимит', () => {
+  const input = {
+    idea: 'Нужен лендинг для салона красоты с записью онлайн',
+    sectionKey: 'context' as const,
+    archetype: 'site_builder' as const,
+    limit: 3,
+  };
+
+  const first = selectSkills(input).map((entry) => entry.skill.id);
+  const second = selectSkills(input).map((entry) => entry.skill.id);
+
+  assert.deepEqual(first, second, 'подбор должен быть детерминирован');
+  assert.ok(first.length <= 3);
+  assert.equal(new Set(first).size, first.length, 'скиллы не должны повторяться');
+  // Для сайта первым идёт скилл структуры лендинга.
+  assert.equal(first[0], 'site-landing-structure');
+  assert.ok(selectSkills({ ...input, limit: 1 }).length === 1);
+});
+
+test('skills: сайт получает скиллы сайтов, а не только маркетинга', () => {
+  const selected = selectSkills({
+    idea: 'Лендинг для салона красоты',
+    sectionKey: 'expertise',
+    archetype: 'site_builder',
+    limit: 3,
+  });
+
+  assert.ok(selected.length > 0);
+  assert.ok(
+    selected.some((entry) => entry.skill.category === 'sites'),
+    'сайтовая задача должна получать скиллы категории «сайты»',
+  );
+  // Есть причина выбора — интерфейс должен объяснять решение.
+  assert.ok(selected.every((entry) => entry.reasons.length > 0));
+});
+
+test('skills: примеры выбираются по порядку скиллов без дублей', () => {
+  const skills = SKILLS.filter((skill) => skill.exampleIds.length > 0).slice(0, 2);
+  const ids = exampleIdsFor(skills);
+
+  assert.ok(ids.length > 0);
+  assert.equal(new Set(ids).size, ids.length, 'примеры не должны дублироваться');
+  for (const id of ids) assert.ok(getLibraryPrompt(id), `пример ${id} не найден`);
+
+  const repeated = exampleIdsFor([skills[0], skills[0]]);
+  assert.deepEqual(repeated, exampleIdsFor([skills[0]]));
+});
+
+test('skills: длинный пример обрезается до лимита и помечается', () => {
+  const long = 'x'.repeat(EXAMPLE_BODY_LIMIT + 500);
+  const truncated = truncateExample(long);
+
+  assert.ok(truncated.length <= EXAMPLE_BODY_LIMIT + 1);
+  assert.ok(truncated.endsWith('…'));
+  assert.equal(truncateExample('короткий'), 'короткий');
+});
+
+/* ─────────────────────────── Промт синтеза ─────────────────────────── */
+
+const SYNTHESIS_BASE = {
+  idea: 'Лендинг для салона красоты',
+  audience: 'владельцы салонов',
+  targetModel: 'gpt-4o',
+  mode: 'professional' as const,
+  sectionTitle: 'CONTEXT — Контекст',
+  sectionKey: 'context',
+  requirements: ['указать тип сайта'],
+  researchFindings: [],
+  researchPractices: [],
+  researchAvoid: [],
+  researchAvailable: false,
+  sources: [],
+  alternatives: 1,
+};
+
+test('synthesisPrompt: без скиллов блоков D и E нет', () => {
+  const pair = synthesisPrompt(SYNTHESIS_BASE);
+
+  assert.doesNotMatch(pair.user, /D\. Профессиональные требования/);
+  assert.doesNotMatch(pair.user, /E\. Примеры из библиотеки/);
+  // Базовая структура A, B, C сохраняется.
+  assert.match(pair.user, /A\. Требования пользователя/);
+  assert.match(pair.user, /B\. Результаты исследования/);
+});
+
+test('synthesisPrompt: скиллы попадают в промт как чек-лист', () => {
+  const [skill] = SKILLS;
+  const pair = synthesisPrompt({
+    ...SYNTHESIS_BASE,
+    skills: [
+      {
+        label: skill.label,
+        categoryLabel: 'Сайты и интерфейсы',
+        guidance: skill.guidance,
+        antiPatterns: skill.antiPatterns,
+      },
+    ],
+  });
+
+  assert.match(pair.user, /D\. Профессиональные требования/);
+  assert.match(pair.user, new RegExp(skill.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  // Требования и антипаттерны присутствуют дословно.
+  assert.ok(pair.user.includes(skill.guidance[0]));
+  assert.ok(pair.user.includes(skill.antiPatterns[0]));
+  // Системная часть запрещает выводить сами чек-листы в раздел.
+  assert.match(pair.system, /не выводи сами чек-листы/);
+});
+
+test('synthesisPrompt: примеры помечены как образец формы', () => {
+  const [prompt] = PROMPT_LIBRARY_PROMPTS;
+  const pair = synthesisPrompt({
+    ...SYNTHESIS_BASE,
+    examples: [
+      {
+        title: prompt.title,
+        body: truncateExample(prompt.body),
+        categoryLabel: 'Сайты и интерфейсы',
+      },
+    ],
+  });
+
+  assert.match(pair.user, /E\. Примеры из библиотеки/);
+  assert.ok(pair.user.includes(prompt.title));
+  // Ключевое ограничение: пример не источник фактов.
+  assert.match(pair.system, /НЕ копируй формулировки/);
+  assert.match(pair.system, /не переноси факты/i);
 });
 
 /* ─────────────────────────── Экспорт и дифф ─────────────────────────── */

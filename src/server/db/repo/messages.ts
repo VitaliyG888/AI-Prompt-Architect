@@ -98,6 +98,38 @@ export class MessageRepository {
     return row ? toMessage(row) : null;
   }
 
+  /**
+   * Вопросы раздела, на которые ещё нет ответа.
+   *
+   * Ответ связывается с вопросом через meta.questionId. Если идентификатор не
+   * передан (старые записи), ответ считается относящимся к последнему вопросу —
+   * поэтому открытым остаётся только он. Интерфейс показывает ровно один
+   * открытый вопрос: так опрос идёт линейно.
+   */
+  pendingQuestions(projectId: string, sectionKey: string): MessageRecord[] {
+    const all = this.list(projectId, sectionKey, 400);
+    const open: MessageRecord[] = [];
+    for (const message of all) {
+      if (message.kind === 'question') {
+        open.push(message);
+        continue;
+      }
+      if (message.kind !== 'answer') continue;
+
+      const questionId = String((message.meta as Record<string, unknown>).questionId ?? '');
+      if (questionId) {
+        const index = open.findIndex(
+          (question) => String((question.meta as Record<string, unknown>).id ?? '') === questionId,
+        );
+        if (index >= 0) open.splice(index, 1);
+      } else if (open.length > 0) {
+        // Старая запись без привязки: ответ закрывает старейший открытый вопрос.
+        open.shift();
+      }
+    }
+    return open;
+  }
+
   count(projectId: string): number {
     const row = getRow(this.db, 'SELECT COUNT(*) AS c FROM messages WHERE project_id = ?', projectId);
     return num(row as Record<string, unknown>, 'c');

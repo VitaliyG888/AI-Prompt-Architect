@@ -113,6 +113,7 @@ export function registerProjectRoutes(router: Router, deps: ApiDeps): void {
         'not_started',
         'awaiting_answer',
         'needs_clarification',
+        'ready_for_synthesis',
         'researching',
         'analyzing',
         'ready',
@@ -161,6 +162,9 @@ export function registerProjectRoutes(router: Router, deps: ApiDeps): void {
       source: result.result.source,
       providerName: result.result.providerName,
       model: result.result.model,
+      // Прозрачность: какие стандарты и примеры задали раздел.
+      skills: result.result.skills,
+      examples: result.result.examples,
     });
   });
 
@@ -251,6 +255,45 @@ export function registerProjectRoutes(router: Router, deps: ApiDeps): void {
       source: result.assembly.source,
       versionId: result.versionId,
     });
+  });
+
+  /**
+   * Финальный проход после интервью: анализ материалов по всем разделам,
+   * подбор стандартов и похожих примеров, затем сборка промта.
+   * Прогресс отдаётся потоком NDJSON, чтобы интерфейс показывал, что происходит.
+   */
+  router.post('/api/projects/:id/finish', ({ params }) => {
+    requireProject(app, params.id);
+    const { stream, send, close } = streamEvents();
+
+    void (async () => {
+      try {
+        send({ type: 'start' });
+        const outcome = await app.orchestrator.finishProject(params.id, (event) => {
+          send({
+            type: 'progress',
+            kind: event.type,
+            message: event.message,
+            section: event.sectionKey,
+            payload: event.payload,
+          });
+        });
+        send({
+          type: 'done',
+          sections: outcome.sections,
+          prompt: outcome.assembly.prompt,
+          quality: outcome.assembly.quality,
+          versionId: outcome.versionId,
+        });
+      } catch (error) {
+        const appError = toAppError(error);
+        send({ type: 'error', code: appError.code, message: appError.message });
+      } finally {
+        close();
+      }
+    })();
+
+    return ndjsonStreamResponse(stream);
   });
 
   router.post('/api/projects/:id/test', async ({ params, request }) => {

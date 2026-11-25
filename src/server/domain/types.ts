@@ -52,6 +52,7 @@ export type SectionStatus =
   | 'not_started'
   | 'awaiting_answer'
   | 'needs_clarification'
+  | 'ready_for_synthesis'
   | 'researching'
   | 'analyzing'
   | 'ready'
@@ -61,6 +62,7 @@ export const SECTION_STATUS_LABELS: Record<SectionStatus, string> = {
   not_started: 'не начат',
   awaiting_answer: 'ожидает ответа',
   needs_clarification: 'требует уточнения',
+  ready_for_synthesis: 'можно собирать',
   researching: 'исследование выполняется',
   analyzing: 'анализируется',
   ready: 'готов',

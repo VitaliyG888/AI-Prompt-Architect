@@ -102,6 +102,19 @@ export const api = {
     api.get(`/api/projects/${id}/sources${section ? `?section=${encodeURIComponent(section)}` : ''}`),
   tests: (id) => api.get(`/api/projects/${id}/tests`),
 
+  // Библиотека стандартов и примеров
+  skills: () => api.get('/api/skills'),
+  skillSelection: (params) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+    }
+    const suffix = query.toString();
+    return api.get(`/api/skills/selection${suffix ? `?${suffix}` : ''}`);
+  },
+  library: () => api.get('/api/library'),
+  libraryPrompt: (id) => api.get(`/api/library/${encodeURIComponent(id)}`),
+
   // Конфигурация
   catalog: () => api.get('/api/config/catalog'),
   providers: () => api.get('/api/providers'),
@@ -133,11 +146,23 @@ export const api = {
  * Возвращает управляемый объект с возможностью отмены.
  */
 export function streamSectionPipeline(projectId, sectionKey, handlers) {
+  return streamNdjson(`/api/projects/${projectId}/sections/${sectionKey}/pipeline`, handlers);
+}
+
+/**
+ * Финальный проход по проекту: анализ материалов, подбор стандартов
+ * и примеров, сборка промта. Прогресс приходит теми же NDJSON-событиями.
+ */
+export function streamProjectFinish(projectId, handlers) {
+  return streamNdjson(`/api/projects/${projectId}/finish`, handlers);
+}
+
+function streamNdjson(path, handlers) {
   const controller = new AbortController();
 
   void (async () => {
     try {
-      const response = await fetch(`/api/projects/${projectId}/sections/${sectionKey}/pipeline`, {
+      const response = await fetch(path, {
         method: 'POST',
         headers: { ...authHeaders(), 'content-type': 'application/json' },
         body: '{}',

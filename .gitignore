@@ -8,3 +8,9 @@ data/
 Thumbs.db
 .opencode/
 coverage/
+
+# Рабочие выгрузки разбора docx. В репозитории остаётся только исходник
+# (promts/*.docx) и результат сборки — src/server/domain/prompt-library.json.
+promts/*.txt
+promts/*.json
+promts/*.docx

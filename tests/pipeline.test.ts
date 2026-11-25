@@ -425,7 +425,10 @@ test('interview: уточнение фиксируется как needs_clarific
 
   assert.equal(result.section.status, 'needs_clarification');
   assert.deepEqual(result.section.openQuestions, ['не указан стек']);
-  assert.equal(app.messages.lastQuestion(project.id, 'role')?.content, 'Какой стек используется?');
+  // Уточняющий вопрос показывается один и содержит пояснение «Зачем».
+  assert.match(app.messages.lastQuestion(project.id, 'role')?.content ?? '', /Какой стек используется\?/);
+  assert.equal(result.nextQuestion?.text, 'Какой стек используется?');
+  assert.equal(result.sectionReady, false);
 });
 
 test('interview: лимит вопросов режима останавливает опрос', async () => {
@@ -434,13 +437,42 @@ test('interview: лимит вопросов режима останавлива
   await orchestrator.initialize(project.id);
 
   // quick: maxQuestionsPerSection = 2 → третий раунд закрывает раздел.
+  // Вопросы должны быть ОТВЕЧЕНЫ, иначе они считаются открытыми и движок
+  // обязан вернуть висящий вопрос, а не закрывать раздел по лимиту.
   app.messages.add({ projectId: project.id, sectionKey: 'role', role: 'assistant', kind: 'question', content: 'q1' });
+  app.messages.add({ projectId: project.id, sectionKey: 'role', role: 'user', kind: 'answer', content: 'ответ 1' });
   app.messages.add({ projectId: project.id, sectionKey: 'role', role: 'assistant', kind: 'question', content: 'q2' });
+  app.messages.add({ projectId: project.id, sectionKey: 'role', role: 'user', kind: 'answer', content: 'ответ 2' });
 
   const result = await orchestrator.askQuestions(project.id, 'role');
   assert.equal(result.questions.length, 0);
   assert.equal(result.sectionReady, true);
   assert.match(result.note, /лимит вопросов/);
+  assert.equal(app.sections.get(project.id, 'role').status, 'ready_for_synthesis');
+});
+
+test('interview: открытый вопрос возвращается повторно и не сжигает раунд', async () => {
+  const { app, orchestrator } = pipeline();
+  const project = newProject(app, 'quick');
+  await orchestrator.initialize(project.id);
+
+  const first = await orchestrator.askQuestions(project.id, 'role');
+  assert.equal(first.questions.length, 1);
+  assert.equal(first.questions[0].id, 'q1');
+
+  // Повторный запрос (перезагрузка страницы, двойной клик) обязан вернуть
+  // тот же вопрос. Раньше он писал новый вопрос, съедал раунд, упирался
+  // в лимит и закрывал раздел, оставляя вопрос без ответа.
+  const second = await orchestrator.askQuestions(project.id, 'role');
+  assert.equal(second.questions.length, 1);
+  assert.equal(second.questions[0].id, 'q1');
+  assert.equal(second.questions[0].text, first.questions[0].text);
+  assert.equal(second.sectionReady, false);
+
+  // В истории по-прежнему ровно один вопрос, а раздел ждёт ответа.
+  const questions = app.messages.list(project.id, 'role').filter((message) => message.kind === 'question');
+  assert.equal(questions.length, 1);
+  assert.equal(app.sections.get(project.id, 'role').status, 'awaiting_answer');
 });
 
 /* ─────────────────────────── Исследование ─────────────────────────── */
@@ -501,7 +533,7 @@ test('synthesis: раздел синтезируется, получает оц�
   );
 });
 
-test('synthesis: при сбое модели раздел собирается из требований и честно помечается', async () => {
+test('synthesis: при сбое модели раздел собирается из требований и не застревает', async () => {
   const { app, orchestrator } = pipeline({ failOperations: new Set(['section_synthesis']) });
   const project = newProject(app);
   await orchestrator.initialize(project.id);
@@ -513,7 +545,14 @@ test('synthesis: при сбое модели раздел собирается 
   const section = app.sections.get(project.id, 'role');
 
   assert.equal(result.result.source, 'heuristic');
-  assert.equal(section.status, 'needs_revision');
+  // Деградация — не тупик. Раздел содержит текст, остаётся рабочим и пригодным
+  // к сборке; факт деградации виден отдельным флагом, а не статусом-стопором.
+  assert.equal(section.status, 'ready_for_synthesis');
+  assert.notEqual(section.status, 'needs_revision');
+  assert.ok(
+    section.flags.some((flag) => flag.startsWith('degraded:')),
+    `факт деградации должен быть виден: ${section.flags.join(', ')}`,
+  );
   assert.match(section.content, /Тон технический/);
   assert.equal(section.quality?.heuristic, true);
   assert.equal(result.result.providerName, '');
@@ -569,6 +608,69 @@ test('assemble: без модели — детерминированная сб�
   assert.match(assembly.prompt, /## ROLE/);
   assert.match(assembly.limitations.join(' '), /без модели/);
   assert.equal(assembly.quality.total > 0, true);
+});
+
+/* ─────────────────────────── Финальный проход ─────────────────────────── */
+
+test('finish: анализирует разделы с материалами, пропускает пустые и сохраняет версию', async () => {
+  const { app, orchestrator } = pipeline();
+  const project = newProject(app);
+  await orchestrator.initialize(project.id);
+
+  // Материалы есть только в двух разделах — остальные обязаны быть пропущены,
+  // а не выдуманы «из воздуха».
+  app.sections.update(project.id, 'role', {
+    requirements: ['Тон технический', 'Без объяснения базовых понятий'],
+  });
+  app.sections.update(project.id, 'constraints', {
+    requirements: ['Не выдумывать факты о проекте'],
+  });
+
+  const events: Array<{ type: string; sectionKey?: string; payload?: Record<string, unknown> }> = [];
+  const outcome = await orchestrator.finishProject(project.id, (event) => {
+    events.push({ type: event.type, sectionKey: event.sectionKey, payload: event.payload });
+  });
+
+  // Итог: версия сохранена, промт собран из материалов.
+  assert.ok(outcome.versionId);
+  assert.ok(outcome.assembly.prompt.length > 0);
+  assert.equal(app.versions.get(outcome.versionId).prompt, outcome.assembly.prompt);
+
+  // Обработаны именно разделы с материалами.
+  const done = outcome.sections.filter((section) => section.total !== null).map((section) => section.key).sort();
+  assert.deepEqual(done, ['constraints', 'role']);
+
+  // Пустые разделы честно помечены пропуском, а не тихо проигнорированы.
+  const skipped = events.filter((event) => event.type === 'skip').map((event) => event.sectionKey).sort();
+  assert.ok(skipped.length > 0, 'должны быть события skip для пустых разделов');
+  assert.ok(!skipped.includes('role'), 'раздел с материалами не может быть пропущен');
+  assert.ok(!skipped.includes('constraints'), 'раздел с материалами не может быть пропущен');
+
+  // Событие section несёт выбранные стандарты — иначе интерфейсу нечего показать.
+  const sectionEvents = events.filter((event) => event.type === 'section');
+  assert.equal(sectionEvents.length, done.length);
+  for (const event of sectionEvents) {
+    assert.ok(Array.isArray(event.payload?.skills), 'в событии section должен быть список стандартов');
+  }
+
+  // Ни один раздел не остался в тупиковом статусе.
+  const sections = app.sections.list(project.id);
+  assert.ok(sections.every((section) => section.status !== 'needs_revision'));
+
+  // Проект переведён в состояние ревью, как после обычной сборки.
+  const after = app.projects.get(project.id);
+  assert.equal(after.stage, 'review');
+});
+
+test('finish: проект без разделов — CONFLICT, а не пустая сборка', async () => {
+  const { app, orchestrator } = pipeline();
+  const project = newProject(app);
+
+  await assert.rejects(orchestrator.finishProject(project.id), (error: unknown) => {
+    assert.ok(error instanceof AppError);
+    assert.equal(error.code, 'CONFLICT');
+    return true;
+  });
 });
 
 /* ─────────────────────────── Тестирование промта ─────────────────────────── */

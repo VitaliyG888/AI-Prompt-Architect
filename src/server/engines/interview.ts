@@ -101,6 +101,22 @@ function normalizeQuestions(raw: unknown, limit: number): InterviewQuestion[] {
   return out;
 }
 
+/**
+ * Вопрос уже задавался? Сравниваем нормализованный текст вопроса с историей.
+ * История хранит вопрос вместе с пояснением и вариантами, поэтому проверяем
+ * вхождение, а не только точное равенство.
+ */
+function isRepeatedQuestion(text: string, asked: string[]): boolean {
+  const norm = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const target = norm(text);
+  if (!target) return false;
+  return asked.some((previous) => {
+    const other = norm(previous);
+    if (!other) return false;
+    return other === target || other.includes(target) || target.includes(other);
+  });
+}
+
 export class InterviewEngine {
   private readonly client: LLMClient;
   private readonly projects: ProjectRepository;
@@ -290,7 +306,9 @@ export class InterviewEngine {
         maxOutputTokens: 1800,
       });
 
-      const questions = normalizeQuestions(result.data.questions, Math.min(3, policy.maxQuestionsPerSection));
+      const questions = normalizeQuestions(result.data.questions, 1).filter(
+        (question) => !isRepeatedQuestion(question.text, asked),
+      );
       return {
         questions,
         note: typeof result.data.note === 'string' ? result.data.note : '',
@@ -307,21 +325,28 @@ export class InterviewEngine {
       log.warn('question generation fell back to heuristic', { code: appError.code });
       const archetype = getArchetype(detectArchetype(project.idea));
       const probes = archetype.probes[sectionKey] ?? [];
+      // Тот же принцип, что и для модели: один вопрос и только новый.
+      const pending = probes.filter((probe) => !isRepeatedQuestion(`Уточните: ${probe}`, asked));
+      const next = pending[0];
       return {
-        questions: probes.slice(0, 2).map((probe, index) => ({
-          id: `h${index + 1}`,
-          text: `Уточните: ${probe}`,
-          why: 'Стандартный вопрос для этого типа задачи (LLM недоступна)',
-          options: [],
-          allowSkip: true,
-          critical: index === 0,
-        })),
+        questions: next
+          ? [
+              {
+                id: `h${round}`,
+                text: `Уточните: ${next}`,
+                why: 'Стандартный вопрос для этого типа задачи (LLM недоступна)',
+                options: [],
+                allowSkip: true,
+                critical: true,
+              },
+            ]
+          : [],
         note:
           appError.code === 'PROVIDER_NOT_CONFIGURED'
             ? 'LLM-провайдер не настроен — показаны типовые вопросы. Настройте провайдера в Settings → AI Providers.'
             : `Не удалось получить вопросы от модели (${appError.message}). Показаны типовые вопросы.`,
-        missing: probes,
-        sectionReady: probes.length === 0,
+        missing: pending.length ? pending : probes,
+        sectionReady: pending.length === 0,
         source: 'heuristic',
       };
     }

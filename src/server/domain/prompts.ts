@@ -270,6 +270,19 @@ ${input.sources.map((s) => `[${s.id}] ${s.title} — ${s.publisher || s.url}\nUR
 
 /* ─────────────────────────── Синтез раздела ─────────────────────────── */
 
+export interface SynthesisExample {
+  title: string;
+  categoryLabel: string;
+  body: string;
+}
+
+export interface SynthesisSkill {
+  label: string;
+  categoryLabel: string;
+  guidance: string[];
+  antiPatterns: string[];
+}
+
 export function synthesisPrompt(input: {
   idea: string;
   audience: string;
@@ -285,7 +298,32 @@ export function synthesisPrompt(input: {
   sources: Array<{ title: string; url: string }>;
   alternatives: number;
   previousContent?: string;
+  /** Профессиональные чек-листы, отобранные под раздел. */
+  skills?: SynthesisSkill[];
+  /** Примеры из библиотеки — как образец формы, не для копирования. */
+  examples?: SynthesisExample[];
 }): PromptPair {
+  const skills = input.skills ?? [];
+  const examples = input.examples ?? [];
+
+  const skillSystem = skills.length
+    ? `
+
+Профессиональные требования (скиллы раздела). Это чек-листы предметной области:
+- выполни каждый пункт «Обязательно» в тексте раздела, если он применим к задаче;
+- не допускай ни одной ошибки из списка «Избегать»;
+- не выводи сами чек-листы в раздел — они задают стандарт, а не содержание.`
+    : '';
+
+  const exampleSystem = examples.length
+    ? `
+
+Примеры из библиотеки промтов. Они показывают форму, уровень конкретики и стиль инструкций:
+- опирайся на структуру и степень детализации, но НЕ копируй формулировки;
+- не переноси факты, цифры, названия компаний и продукты из примеров — они относятся к другим задачам;
+- если пример противоречит требованию пользователя или скиллу, побеждает требование пользователя.`
+    : '';
+
   return {
     system: `Ты Section Architect. Проектируешь один раздел итогового промта методом синтеза трёх оснований:
 
@@ -301,7 +339,7 @@ C. Собственный профессиональный вариант, ко�
 - без дублирования и без «воды»; каждая строка меняет поведение;
 - только то, что целевая модель действительно может выполнить.
 
-${SHARED_PRINCIPLES}
+${SHARED_PRINCIPLES}${skillSystem}${exampleSystem}
 
 Верни ТОЛЬКО JSON:
 {
@@ -332,7 +370,31 @@ ${input.researchPractices.length ? input.researchPractices.map((p) => `- ${p}`).
 ${input.sources.length ? `Источники, на которые можно сослаться в обосновании: ${input.sources.map((s) => s.url).join(', ')}` : ''}
 
 ${input.previousContent ? `Текущая версия раздела (переработай с учётом замечаний, сохранив верные части):\n${input.previousContent}` : ''}
-
+${
+  skills.length
+    ? `
+D. Профессиональные требования к разделу (${skills.map((skill) => `${skill.label} [${skill.categoryLabel}]`).join('; ')}):
+${skills
+  .map(
+    (skill) =>
+      `### ${skill.label}\nОбязательно:\n${skill.guidance.map((item) => `- ${item}`).join('\n')}\nИзбегать:\n${skill.antiPatterns.map((item) => `- ${item}`).join('\n')}`,
+  )
+  .join('\n\n')}
+`
+    : ''
+}${
+  examples.length
+    ? `
+E. Примеры из библиотеки (образец формы, не источник фактов):
+${examples
+  .map(
+    (example) =>
+      `--- ${example.title} · ${example.categoryLabel}\n${example.body}`,
+  )
+  .join('\n\n')}
+`
+    : ''
+}
 C. Разработай собственный вариант раздела и синтезируй финальную версию.`,
   };
 }

@@ -113,7 +113,15 @@ export class PromptOrchestrator {
     return { project: updated, sections, plan };
   }
 
-  /** Следующие вопросы по разделу с записью в историю. */
+  /**
+   * Следующие вопросы по разделу с записью в историю.
+   *
+   * Метод идемпотентен по открытому вопросу: если в разделе уже есть вопрос
+   * без ответа, он и возвращается. Иначе повторный вызов (интерфейс после
+   * перезагрузки, двойной клик, восстановление сессии) сжигал бы раунд,
+   * упирался в лимит режима и закрывал раздел «готов к сборке», оставляя
+   * заданный вопрос висеть без ответа.
+   */
   async askQuestions(projectId: string, sectionKey: SectionKey): Promise<{
     questions: Awaited<ReturnType<InterviewEngine['nextQuestions']>>['questions'];
     note: string;
@@ -121,9 +129,46 @@ export class PromptOrchestrator {
     source: string;
   }> {
     const project = this.d.projects.get(projectId);
+    const pending = this.d.messages.pendingQuestions(projectId, sectionKey)[0] ?? null;
+
+    if (pending) {
+      const meta = pending.meta as Record<string, unknown>;
+      return {
+        questions: [
+          {
+            id: String(meta.id ?? ''),
+            text: String(meta.text ?? pending.content),
+            why: typeof meta.why === 'string' ? meta.why : '',
+            options: Array.isArray(meta.options)
+              ? (meta.options as Array<{ label: string; description: string }>)
+              : [],
+            critical: meta.critical === true,
+            allowSkip: meta.allowSkip !== false,
+          },
+        ],
+        note: '',
+        sectionReady: false,
+        source: 'pending',
+      };
+    }
+
     const result = await this.d.interview.nextQuestions(project, sectionKey);
 
+    // id вопроса должен быть уникален в пределах раздела: модель возвращает
+    // "q1" в каждом раунде, и при повторе ответ закрывал бы чужой вопрос.
+    const existing = this.d.messages.list(projectId, sectionKey, 400);
+    const usedIds = new Set(
+      existing
+        .filter((message) => message.kind === 'question')
+        .map((message) => String((message.meta as Record<string, unknown>).id ?? '')),
+    );
+    const round = existing.filter((message) => message.kind === 'question').length + 1;
+
     for (const question of result.questions) {
+      const base = question.id || `q${round}`;
+      const id = usedIds.has(base) ? `${base}-${round}` : base;
+      usedIds.add(id);
+
       const text = [
         question.text,
         question.why ? `\n_Зачем: ${question.why}_` : '',
@@ -138,24 +183,40 @@ export class PromptOrchestrator {
         role: 'assistant',
         kind: 'question',
         content: text,
-        meta: { id: question.id, options: question.options, critical: question.critical, allowSkip: question.allowSkip },
+        // text/why храним отдельно: интерфейс показывает вопрос карточкой,
+        // а не разбирает markdown обратно.
+        meta: {
+          id,
+          text: question.text,
+          why: question.why,
+          options: question.options,
+          critical: question.critical,
+          allowSkip: question.allowSkip,
+        },
       });
     }
 
     if (result.questions.length > 0) {
       this.d.sections.update(projectId, sectionKey, { status: 'awaiting_answer' });
     } else if (result.sectionReady) {
-      this.d.sections.update(projectId, sectionKey, { status: 'needs_revision' });
+      // Интервью по разделу закончено. Это НЕ «требует пересмотра»: раздел
+      // готов к сборке, иначе он навсегда остаётся в тупиковом статусе.
+      this.d.sections.update(projectId, sectionKey, { status: 'ready_for_synthesis' });
     }
 
-    this.d.messages.add({
-      projectId,
-      sectionKey,
-      role: 'assistant',
-      kind: 'note',
-      content: result.note || (result.questions.length ? '' : 'Вопросов больше нет — можно переходить к синтезу раздела.'),
-      meta: { source: result.source, providerName: result.providerName, model: result.model },
-    });
+    // Пустые заметки не пишем: они засоряют диалог и сбивают автопрокрутку.
+    const noteText =
+      result.note || (result.questions.length ? '' : 'Вопросов больше нет — раздел готов к сборке.');
+    if (noteText) {
+      this.d.messages.add({
+        projectId,
+        sectionKey,
+        role: 'assistant',
+        kind: 'note',
+        content: noteText,
+        meta: { source: result.source, providerName: result.providerName, model: result.model },
+      });
+    }
 
     return {
       questions: result.questions,
@@ -165,7 +226,7 @@ export class PromptOrchestrator {
     };
   }
 
-  /** Приём ответа пользователя и анализ требований. */
+  /** Приём ответа пользователя: анализ требований и сразу следующий шаг. */
   async submitAnswer(input: {
     projectId: string;
     sectionKey: SectionKey;
@@ -174,6 +235,10 @@ export class PromptOrchestrator {
   }): Promise<{
     analysis: Awaited<ReturnType<InterviewEngine['analyzeAnswer']>>;
     section: SectionRecord;
+    /** Вопрос, который ждёт ответа сейчас (ровно один). */
+    nextQuestion: { id: string; text: string; options: Array<{ label: string; description: string }> } | null;
+    /** Интервью по разделу закончено — можно собирать. */
+    sectionReady: boolean;
   }> {
     const project = this.d.projects.get(input.projectId);
     const lastQuestion = this.d.messages.lastQuestion(input.projectId, input.sectionKey);
@@ -198,12 +263,11 @@ export class PromptOrchestrator {
     const mergedRequirements = [...new Set([...section.requirements, ...analysis.requirements])];
     const flags = [...new Set([...section.flags, ...analysis.assumptions.map((a) => `assumption:${a}`)])];
 
-    const updated = this.d.sections.update(input.projectId, input.sectionKey, {
+    this.d.sections.update(input.projectId, input.sectionKey, {
       requirements: mergedRequirements,
       openQuestions: analysis.needsClarification
         ? [...new Set([...section.openQuestions, ...analysis.gaps])]
         : [...new Set(analysis.gaps)],
-      status: analysis.needsClarification ? 'needs_clarification' : 'awaiting_answer',
       flags,
       decisions: [
         ...section.decisions,
@@ -215,29 +279,67 @@ export class PromptOrchestrator {
       ],
     });
 
+    // Уточнение нужно только если без него раздел нельзя спроектировать.
+    // Показываем ровно один уточняющий вопрос: интервью остаётся линейным.
     if (analysis.needsClarification && analysis.clarifyingQuestions.length > 0) {
-      for (const question of analysis.clarifyingQuestions) {
-        this.d.messages.add({
-          projectId: input.projectId,
-          sectionKey: input.sectionKey,
-          role: 'assistant',
-          kind: 'question',
-          content: question.text,
-          meta: { id: question.id, options: question.options, clarifying: true },
-        });
-      }
+      const clarifying = analysis.clarifyingQuestions[0];
+      // Уточняющий вопрос нумеруем отдельно: он не должен конфликтовать с id
+      // вопросов интервью, иначе ответ закроет не тот вопрос.
+      const clarifyingId = `c${this.d.messages.list(input.projectId, input.sectionKey, 400).filter((message) => message.kind === 'question').length + 1}`;
+      const content = [
+        clarifying.text,
+        clarifying.why ? `\n_Зачем: ${clarifying.why}_` : '',
+        clarifying.options.length
+          ? `\n${clarifying.options.map((option, index) => `${index + 1}. **${option.label}**${option.description ? ` — ${option.description}` : ''}`).join('\n')}`
+          : '',
+      ].join('');
+
       this.d.messages.add({
         projectId: input.projectId,
         sectionKey: input.sectionKey,
         role: 'assistant',
-        kind: 'note',
-        content: 'Нужно уточнение, чтобы раздел получился качественным.',
-        meta: { source: analysis.source },
+        kind: 'question',
+        content,
+        // id уникален в пределах раздела: иначе ответ закроет чужой вопрос.
+        meta: { id: clarifyingId, options: clarifying.options, clarifying: true },
       });
+
+      const updated = this.d.sections.update(input.projectId, input.sectionKey, {
+        status: 'needs_clarification',
+      });
+      this.d.projects.touch(input.projectId);
+
+      return {
+        analysis,
+        section: updated,
+        nextQuestion: { id: clarifying.id, text: clarifying.text, options: clarifying.options },
+        sectionReady: false,
+      };
     }
 
-    this.d.projects.touch(input.projectId);
-    return { analysis, section: updated };
+    // Уточнений не требуется — сразу переходим к следующему вопросу.
+    // Ответ на него сохраняется отдельным вызовом, поэтому состояние не теряется
+    // и после перезапуска приложения интервью продолжается с того же места.
+    await this.askQuestions(input.projectId, input.sectionKey);
+
+    const after = this.d.sections.get(input.projectId, input.sectionKey);
+    const open = this.d.messages.pendingQuestions(input.projectId, input.sectionKey);
+    const pending = open[0] ?? null;
+
+    return {
+      analysis,
+      section: after,
+      nextQuestion: pending
+        ? {
+            id: String((pending.meta as Record<string, unknown>).id ?? ''),
+            text: String((pending.meta as Record<string, unknown>).text ?? pending.content),
+            options: Array.isArray((pending.meta as Record<string, unknown>).options)
+              ? ((pending.meta as Record<string, unknown>).options as Array<{ label: string; description: string }>)
+              : [],
+          }
+        : null,
+      sectionReady: after.status === 'ready_for_synthesis',
+    };
   }
 
   /** Исследование раздела. */
@@ -307,6 +409,85 @@ export class PromptOrchestrator {
 
     this.recomputeStage(projectId);
     return { result, quality: section.quality, affected: affected.affected };
+  }
+
+  /**
+   * Завершение интервью: анализ материалов по всем разделам и сборка промта.
+   *
+   * Порядок соответствует требованию продукта:
+   *   анализ требований → подбор скиллов и похожих примеров → сборка промта.
+   * Раздел без материалов не выдумывается, а честно пропускается с отметкой.
+   */
+  async finishProject(projectId: string, emit?: EventSink): Promise<{
+    sections: Array<{ key: SectionKey; title: string; status: string; total: number | null }>;
+    assembly: AssemblyResult;
+    versionId: string;
+  }> {
+    this.d.projects.get(projectId);
+    const sections = this.d.sections.list(projectId);
+    if (sections.length === 0) {
+      throw new AppError('CONFLICT', 'Проект не инициализирован: сначала составьте план интервью');
+    }
+
+    const results: Array<{ key: SectionKey; title: string; status: string; total: number | null }> = [];
+
+    for (const section of sections) {
+      // Нечего собирать: нет ни требований, ни текста. Пропускаем явно.
+      if (section.requirements.length === 0 && section.content.trim().length === 0) {
+        emit?.({
+          type: 'skip',
+          sectionKey: section.key,
+          message: `Раздел «${section.title}» пропущен: нет материалов`,
+        });
+        results.push({ key: section.key, title: section.title, status: section.status, total: null });
+        continue;
+      }
+
+      emit?.({
+        type: 'step',
+        sectionKey: section.key,
+        message: `Анализ материалов и подбор стандартов: ${section.title}`,
+      });
+
+      try {
+        const outcome = await this.synthesizeSection(projectId, section.key);
+        results.push({
+          key: section.key,
+          title: section.title,
+          status: outcome.result.section.status,
+          total: outcome.quality?.total ?? null,
+        });
+        emit?.({
+          type: 'section',
+          sectionKey: section.key,
+          message: `Раздел готов: ${section.title}`,
+          payload: {
+            status: outcome.result.section.status,
+            total: outcome.quality?.total ?? null,
+            skills: outcome.result.skills.map((skill) => skill.label),
+            examples: outcome.result.examples.map((example) => example.title),
+          },
+        });
+      } catch (error) {
+        // Один неудачный раздел не должен отменять всю сборку.
+        emit?.({
+          type: 'sectionError',
+          sectionKey: section.key,
+          message: `Раздел «${section.title}» не собран: ${toAppError(error).message}`,
+        });
+        results.push({ key: section.key, title: section.title, status: 'needs_revision', total: null });
+      }
+    }
+
+    emit?.({ type: 'step', message: 'Сборка итогового промта…' });
+    const { assembly, versionId } = await this.assemble(projectId);
+    emit?.({
+      type: 'done',
+      message: `Промт собран: ${assembly.prompt.length} символов, версия сохранена`,
+      payload: { versionId },
+    });
+
+    return { sections: results, assembly, versionId };
   }
 
   /** Финальная сборка + сохранение версии. */

@@ -2,7 +2,7 @@
  * Рабочее пространство проекта: разделы · диалог · инспектор.
  * Все действия идут через API; состояние перечитывается после мутаций.
  */
-import { api, streamSectionPipeline } from '../api.js';
+import { api, streamSectionPipeline, streamProjectFinish } from '../api.js';
 import {
   h,
   clear,
@@ -32,6 +32,7 @@ const TABS = [
   { key: 'quality', label: 'Качество' },
   { key: 'sources', label: 'Источники' },
   { key: 'research', label: 'Исследование' },
+  { key: 'skills', label: 'Стандарты' },
 ];
 
 export async function renderWorkspace(container, params) {
@@ -102,7 +103,7 @@ export async function renderWorkspace(container, params) {
     const exportBtn = h('button', { class: 'btn', type: 'button' }, 'Экспорт');
     const settingsBtn = h('button', { class: 'btn btn-ghost btn-icon', type: 'button', title: 'Настройки проекта' }, '⚙');
 
-    assembleBtn.addEventListener('click', () => void runAssemble(assembleBtn));
+    assembleBtn.addEventListener('click', () => void finishProject());
     testBtn.addEventListener('click', () => void openTestDialog(testBtn));
     versionsBtn.addEventListener('click', () => openVersions());
     exportBtn.addEventListener('click', () => openExport());
@@ -201,6 +202,40 @@ export async function renderWorkspace(container, params) {
     return data.messages.filter((message) => message.sectionKey === activeKey || (message.sectionKey === '' && message.kind === 'event'));
   }
 
+  /**
+   * Открытый вопрос раздела — ровно один.
+   *
+   * Ответ связывается с вопросом через meta.questionId. Вопросы без ответа
+   * считаются открытыми; первым показываем самый ранний, чтобы порядок
+   * не зависел от порядка отрисовки.
+   */
+  function pendingQuestion(messages = sectionMessages()) {
+    const answered = new Set();
+    for (const message of messages) {
+      if (message.kind !== 'answer') continue;
+      const id = message.meta?.questionId;
+      if (id) answered.add(String(id));
+    }
+    const questions = messages.filter((message) => message.kind === 'question');
+    return questions.find((message) => !answered.has(String(message.meta?.id ?? ''))) ?? null;
+  }
+
+  /** Текст вопроса без служебного пояснения и вариантов. */
+  function questionText(message) {
+    return String(message.meta?.text ?? message.content ?? '').split('\n')[0].trim();
+  }
+
+  /** Ответы, сгруппированные по id вопроса: нужны, чтобы свернуть историю. */
+  function answersByQuestion(messages) {
+    const map = new Map();
+    for (const message of messages) {
+      if (message.kind !== 'answer') continue;
+      const id = String(message.meta?.questionId ?? '');
+      if (id) map.set(id, message.content);
+    }
+    return map;
+  }
+
   function renderChat(scrollTop) {
     clear(chatSlot);
     chatScroll = h('div', { class: 'chat-scroll' });
@@ -232,11 +267,17 @@ export async function renderWorkspace(container, params) {
           }, 'Составить план'),
         }),
       );
-      renderComposer(null);
+      renderComposer(null, null);
       return;
     }
 
-    if (!messages.length) {
+    // Текущий вопрос — один. Он показывается карточкой над полем ввода,
+    // поэтому прокручивать диалог, чтобы до него добраться, не нужно.
+    const open = pendingQuestion(messages);
+    const answers = answersByQuestion(messages);
+    const history = messages.filter((message) => message !== open);
+
+    if (!history.length && !open) {
       chatScroll.append(
         h(
           'div',
@@ -245,26 +286,75 @@ export async function renderWorkspace(container, params) {
           h(
             'p',
             { style: { marginTop: '8px' } },
-            'Получите вопросы интервью или сразу перейдите к исследованию и синтезу. Ответы на вопросы становятся требованиями раздела.',
+            'Вопросов пока нет. Они появятся автоматически, если провайдер настроен; иначе используйте «Полный цикл».',
           ),
         ),
       );
     }
 
-    for (const message of messages) chatScroll.append(renderMessage(message));
+    for (const message of history) chatScroll.append(renderMessage(message, answers));
 
-    renderComposer(section);
+    renderComposer(section, open);
 
     if (scrollTop !== undefined) chatScroll.scrollTop = scrollTop;
     else chatScroll.scrollTop = chatScroll.scrollHeight;
+
+    void ensureQuestion(section);
   }
 
-  function renderMessage(message) {
+  /**
+   * Свёрнутая строка истории: вопрос и ответ в одну строку.
+   * Держит диалог компактным, чтобы текущий вопрос был единственным крупным блоком.
+   */
+  function renderMessage(message, answers = new Map()) {
     const meta = message.meta ?? {};
     const role = message.role === 'user' ? 'user' : 'assistant';
     const kind = message.kind ?? 'chat';
 
+    if (kind === 'question') {
+      const answer = answers.get(String(meta.id ?? ''));
+      return h(
+        'details',
+        { class: 'msg-history' },
+        h(
+          'summary',
+          {},
+          h('span', { class: 'q-mark' }, answer ? '✓' : '?'),
+          h('span', { class: 'q-text' }, questionText(message)),
+          answer ? h('span', { class: 'q-answer' }, ` — ${answer}`) : null,
+        ),
+        h('div', { class: 'msg-history-body' }, md(message.content)),
+      );
+    }
+
+    if (kind === 'event' || kind === 'note') {
+      return h('div', { class: 'msg', dataset: { role, kind } }, h('div', { class: 'msg-bubble' }, md(message.content)));
+    }
+
+    const attribution = [meta.providerName, meta.model].filter(Boolean).join(' · ');
+    return h(
+      'div',
+      { class: 'msg', dataset: { role, kind } },
+      h('div', { class: 'msg-bubble' }, md(message.content)),
+      h(
+        'div',
+        { class: 'msg-meta' },
+        [
+          role === 'user' ? 'вы' : 'ассистент',
+          attribution ? ` · ${attribution}` : '',
+          meta.source === 'heuristic' ? ' · эвристика' : '',
+          ` · ${new Date(message.createdAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`,
+        ].join(''),
+      ),
+    );
+  }
+
+  /** Карточка текущего вопроса: текст, пояснение, варианты. */
+  function renderQuestionCard(section, question) {
+    if (!section || !question) return null;
+    const meta = question.meta ?? {};
     const options = Array.isArray(meta.options) ? meta.options : [];
+
     const optionsBox = options.length
       ? h(
           'div',
@@ -277,8 +367,9 @@ export async function renderWorkspace(container, params) {
                 type: 'button',
                 onclick: () => {
                   const text = option.description ? `${option.label} — ${option.description}` : option.label;
-                  composerInput.value = composerInput.value ? `${composerInput.value}\n${text}` : text;
+                  composerInput.value = text;
                   composerInput.focus();
+                  sendBtn.disabled = false;
                 },
               },
               h('strong', {}, `${index + 1}. ${option.label ?? ''}`),
@@ -288,41 +379,37 @@ export async function renderWorkspace(container, params) {
         )
       : null;
 
-    let body;
-    if (kind === 'question' || kind === 'note') body = md(message.content);
-    else body = md(message.content);
-
-    const attribution = [meta.providerName, meta.model].filter(Boolean).join(' · ');
-
     return h(
       'div',
-      { class: 'msg', dataset: { role, kind } },
-      h('div', { class: 'msg-bubble' }, body, optionsBox),
-      h(
-        'div',
-        { class: 'msg-meta' },
-        [
-          kind === 'question' ? 'вопрос' : kind === 'note' ? 'заметка' : kind === 'event' ? 'событие' : role === 'user' ? 'вы' : 'ассистент',
-          attribution ? ` · ${attribution}` : '',
-          meta.source === 'heuristic' ? ' · эвристика' : '',
-          ` · ${new Date(message.createdAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`,
-        ].join(''),
-      ),
+      { class: 'question-card' },
+      h('div', { class: 'question-card-label' }, `Раздел: ${section.title.split(' — ')[0]}`),
+      h('div', { class: 'question-card-text' }, questionText(question)),
+      meta.why ? h('div', { class: 'question-card-why' }, `Зачем: ${meta.why}`) : null,
+      optionsBox,
     );
   }
 
-  function renderComposer(section) {
+  function renderComposer(section, question = null) {
     chatSlot.querySelector('.chat-compose')?.remove();
     const disabled = !section || streaming;
 
+    const card = renderQuestionCard(section, question);
     const compose = h(
       'div',
       { class: 'chat-compose' },
+      card,
       composerInput,
       h(
         'div',
         { class: 'row gap-8 wrap' },
         sendBtn,
+        section && !question
+          ? h('button', {
+              class: 'btn btn-sm',
+              type: 'button',
+              onclick: () => void finishProject(),
+            }, 'Завершить и собрать')
+          : null,
         h('div', { class: 'grow' }),
         askBtn,
         researchBtn,
@@ -333,7 +420,9 @@ export async function renderWorkspace(container, params) {
         ? h(
             'div',
             { class: 'faint', style: { fontSize: '11px' } },
-            `Ответы сохраняются в требования раздела. Раздел: ${section.title}`,
+            question
+              ? 'Ответ сохраняется сразу и становится требованием раздела.'
+              : `Вопросов нет. Раздел: ${section.title.split(' — ')[0]}`,
           )
         : null,
     );
@@ -360,30 +449,80 @@ export async function renderWorkspace(container, params) {
 
   sendBtn.addEventListener('click', () => void submitAnswer());
 
-  /** Отправка ответа и автоматический запрос следующего вопроса. */
+  /**
+   * Разделы, где вопросов больше нет. Нужен, чтобы интерфейс не зацикливался
+   * на запросе вопросов: движок вернул пустой список — это ответ, а не сбой.
+   */
+  const exhausted = new Set();
+  const questionInFlight = new Set();
+
+  /**
+   * Дозапрашивает вопрос, если у раздела его нет.
+   *
+   * Интерфейс сам ведёт опрос: как только открытый вопрос отсутствует, а раздел
+   * ещё не собран, вопрос запрашивается автоматически. Пользователь не должен
+   * нажимать «Вопросы» и не должен искать, что делать дальше.
+   */
+  async function ensureQuestion(section) {
+    if (!section || streaming) return;
+    if (pendingQuestion()) {
+      exhausted.delete(section.key);
+      return;
+    }
+    if (exhausted.has(section.key)) return;
+    if (['ready', 'ready_for_synthesis', 'researching', 'analyzing'].includes(section.status)) return;
+    if (questionInFlight.has(section.key)) return;
+
+    questionInFlight.add(section.key);
+    try {
+      const result = await api.askQuestions(projectId, section.key);
+      if (!result.questions?.length) exhausted.add(section.key);
+      await reload({ keepScroll: false });
+    } catch {
+      // Вопросы — необязательный шаг: раздел можно собрать и без них.
+      exhausted.add(section.key);
+    } finally {
+      questionInFlight.delete(section.key);
+    }
+  }
+
+  /** Ответ сохраняется сразу; после последнего вопроса опрос идёт дальше сам. */
   async function submitAnswer() {
     const section = currentSection();
     const answer = composerInput.value.trim();
-    if (!section || !answer) return;
+    if (!section || !answer || streaming) return;
 
+    const question = pendingQuestion();
     const busy = busyState(sendBtn);
-    busy.start('Отправка…');
+    busy.start('Сохранение…');
     try {
-      await api.submitAnswer(projectId, section.key, answer);
+      const result = await api.submitAnswer(projectId, section.key, answer, question?.meta?.id);
       composerInput.value = '';
-      const ids = [...document.querySelectorAll('.msg[data-kind="question"]')];
-      void ids;
-      await reload({ keepScroll: false });
+      sendBtn.disabled = true;
 
-      // Продолжаем опрос, если раздел ещё не готов.
-      const updated = currentSection();
-      if (updated && ['awaiting_answer', 'needs_clarification', 'not_started'].includes(updated.status)) {
-        try {
-          await api.askQuestions(projectId, section.key);
-          await reload({ keepScroll: false });
-        } catch {
-          /* вопросы — необязательный шаг: ответ уже сохранён */
+      if (result.sectionReady || !result.nextQuestion) {
+        // Вопросы по разделу закончились. Снимок ниже — свежий: он получен
+        // перезагрузкой, а не взят до сохранения ответа.
+        exhausted.add(section.key);
+        await reload({ keepScroll: false });
+
+        const next = data.sections.find(
+          (item) => item.key !== section.key && !['ready', 'ready_for_synthesis'].includes(item.status),
+        );
+        if (next) {
+          activeKey = next.key;
+          renderSections();
+          renderChat();
+          renderInspector();
         }
+
+        // Все разделы собрали материалы — сразу переходим к анализу,
+        // подбору стандартов и примеров, затем к сборке промта.
+        const allDone = data.sections.every((item) => ['ready', 'ready_for_synthesis'].includes(item.status));
+        const hasMaterials = data.sections.some((item) => (item.requirements?.length ?? 0) > 0);
+        if (allDone && hasMaterials) void finishProject();
+      } else {
+        await reload({ keepScroll: false });
       }
     } catch (error) {
       toast(errorMessage(error), 'error');
@@ -587,6 +726,7 @@ export async function renderWorkspace(container, params) {
     if (activeTab === 'draft') renderDraftTab(body, section);
     else if (activeTab === 'quality') renderQualityTab(body, section);
     else if (activeTab === 'sources') renderSourcesTab(body, section);
+    else if (activeTab === 'skills') renderSkillsTab(body, section);
     else renderResearchTab(body, section);
 
     inspectorSlot.append(
@@ -883,6 +1023,235 @@ export async function renderWorkspace(container, params) {
     }
   }
 
+  /* ─────────────────────────── Стандарты раздела ─────────────────────────── */
+
+  // Справочные данные читаются один раз за сессию страницы: каталог скиллов
+  // и индекс библиотеки примеров меняются только вместе с кодом.
+  let skillCatalog = null;
+  let skillCatalogPromise = null;
+  let libraryIndex = null;
+  let libraryPromise = null;
+
+  function loadSkillCatalog() {
+    if (skillCatalog) return Promise.resolve(skillCatalog);
+    if (!skillCatalogPromise) {
+      skillCatalogPromise = api
+        .skills()
+        .then((payload) => {
+          skillCatalog = new Map((payload.skills ?? []).map((skill) => [skill.id, skill]));
+          return skillCatalog;
+        })
+        .catch((error) => {
+          skillCatalogPromise = null;
+          throw error;
+        });
+    }
+    return skillCatalogPromise;
+  }
+
+  function loadLibraryIndex() {
+    if (libraryIndex) return Promise.resolve(libraryIndex);
+    if (!libraryPromise) {
+      libraryPromise = api
+        .library()
+        .then((payload) => {
+          libraryIndex = new Map((payload.items ?? []).map((item) => [item.id, item]));
+          return libraryIndex;
+        })
+        .catch((error) => {
+          libraryPromise = null;
+          throw error;
+        });
+    }
+    return libraryPromise;
+  }
+
+  /** Карточка стандарта: что обязательно выполнить и каких ошибок избегать. */
+  function skillCard(entry, skill) {
+    const card = h(
+      'div',
+      { class: 'skill-card' },
+      h(
+        'div',
+        { class: 'row gap-6 wrap', style: { alignItems: 'baseline' } },
+        h('div', { style: { fontWeight: '600', fontSize: '12.5px' } }, skill.label),
+        skill.categoryLabel ? chip(skill.categoryLabel) : null,
+      ),
+      entry.reasons?.length ? h('div', { class: 'faint', style: { fontSize: '11px' } }, `почему: ${entry.reasons.join(' · ')}`) : null,
+    );
+
+    if (skill.guidance?.length) {
+      card.append(
+        h('div', { class: 'card-title mt-8' }, 'Обязательно'),
+        h(
+          'div',
+          { class: 'checklist mt-4' },
+          skill.guidance.map((line) => h('div', { class: 'check' }, h('span', {}, '✓'), h('span', {}, line))),
+        ),
+      );
+    }
+
+    if (skill.antiPatterns?.length) {
+      card.append(
+        h('div', { class: 'card-title mt-8' }, 'Избегать'),
+        h(
+          'div',
+          { class: 'checklist mt-4' },
+          skill.antiPatterns.map((line) =>
+            h('div', { class: 'check', dataset: { pass: 'false' } }, h('span', {}, '×'), h('span', {}, line)),
+          ),
+        ),
+      );
+    }
+
+    return card;
+  }
+
+  /**
+   * Вкладка «Стандарты»: на каком профессиональном чек-листе собран раздел.
+   * Если синтеза ещё не было — показывает предварительный подбор, чтобы
+   * решение движка не было «чёрным ящиком».
+   */
+  function renderSkillsTab(body, section) {
+    const applied = (section.flags ?? [])
+      .filter((flag) => flag.startsWith('skill:'))
+      .map((flag) => flag.slice('skill:'.length));
+
+    const status = h(
+      'div',
+      { class: 'faint', style: { fontSize: '11.5px' } },
+      applied.length ? `Применено при синтезе: ${applied.length}` : 'Стандарт ещё не применён',
+    );
+    const list = h('div', { class: 'stack gap-8 mt-8' });
+    body.append(status, list);
+
+    void (async () => {
+      let catalog;
+      try {
+        catalog = await loadSkillCatalog();
+      } catch (error) {
+        list.append(
+          h('div', { class: 'status-line', dataset: { tone: 'error' } }, `Не удалось прочитать каталог стандартов: ${errorMessage(error)}`),
+        );
+        return;
+      }
+
+      if (applied.length) {
+        const used = [];
+        for (const id of applied) {
+          const skill = catalog.get(id);
+          if (!skill) {
+            list.append(h('div', { class: 'issue' }, `Стандарт ${id} не найден в каталоге`));
+            continue;
+          }
+          used.push(skill);
+          list.append(skillCard({ reasons: [] }, skill));
+        }
+        await renderSkillExamples(list, used);
+        return;
+      }
+
+      list.append(
+        h(
+          'p',
+          { class: 'muted', style: { margin: '0', fontSize: '12.5px' } },
+          'Раздел ещё не синтезирован. Ниже — стандарты, которые будут к нему применены.',
+        ),
+      );
+
+      let selection = [];
+      try {
+        const payload = await api.skillSelection({ idea: data.project.idea, section: section.key, limit: 3 });
+        selection = payload.selection ?? [];
+        if (payload.archetype) status.textContent = `Задача распознана как «${payload.archetype}» · стандарт ещё не применён`;
+      } catch (error) {
+        list.append(h('div', { class: 'status-line', dataset: { tone: 'warn' } }, `Подбор недоступен: ${errorMessage(error)}`));
+        return;
+      }
+
+      if (!selection.length) {
+        list.append(
+          emptyState({
+            title: 'Подбор пуст',
+            text: 'Для этой задачи и раздела подходящих стандартов нет — синтез идёт на требованиях и исследовании.',
+          }),
+        );
+        return;
+      }
+
+      const used = [];
+      for (const entry of selection) {
+        const skill = catalog.get(entry.id);
+        if (!skill) continue;
+        used.push(skill);
+        list.append(skillCard(entry, skill));
+      }
+      await renderSkillExamples(list, used);
+    })();
+  }
+
+  /** Примеры библиотеки, на которые опирается раздел: только заголовки и просмотр. */
+  async function renderSkillExamples(list, skills) {
+    const ids = [...new Set(skills.flatMap((skill) => skill.exampleIds ?? []))];
+    if (!ids.length) return;
+
+    let index;
+    try {
+      index = await loadLibraryIndex();
+    } catch {
+      return;
+    }
+
+    const found = ids.map((id) => index.get(id)).filter(Boolean);
+    if (!found.length) return;
+    if (!list.isConnected) return;
+
+    list.append(
+      h('div', { class: 'card-title mt-12' }, `Примеры из библиотеки (${found.length})`),
+      h(
+        'div',
+        { class: 'stack gap-4 mt-8' },
+        found.map((item) =>
+          h(
+            'button',
+            {
+              class: 'link-row',
+              type: 'button',
+              onclick: () => void openLibraryExample(item),
+            },
+            h('span', { class: 'truncate' }, item.title),
+            h('span', { class: 'faint' }, `${fmtNumber(item.chars)} симв.`),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /** Просмотр примера целиком — как ориентир формы, а не источник фактов. */
+  async function openLibraryExample(item) {
+    const box = h('div', { class: 'draft-box', style: { maxHeight: '420px' } }, 'Загрузка…');
+    const dialog = openModal({
+      title: item.title,
+      body: h(
+        'div',
+        { class: 'stack gap-8' },
+        h('div', { class: 'faint', style: { fontSize: '11px' } }, item.categoryLabel ?? item.category ?? ''),
+        box,
+      ),
+      footer: h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onclick: () => dialog.close() }, 'Закрыть')),
+      width: '720px',
+    });
+
+    try {
+      const payload = await api.libraryPrompt(item.id);
+      clear(box);
+      box.append(md(payload.prompt.body));
+    } catch (error) {
+      clear(box);
+      box.append(h('div', { class: 'status-line', dataset: { tone: 'error' } }, errorMessage(error)));
+    }
+  }
+
   function renderResearchTab(body, section) {
     const research = section.research ?? {};
     body.append(
@@ -935,22 +1304,92 @@ export async function renderWorkspace(container, params) {
     );
   }
 
-  /* ─────────────────────────── Сборка ─────────────────────────── */
+  /* ─────────────────────────── Финал интервью ─────────────────────────── */
 
-  async function runAssemble(button) {
-    const busy = busyState(button);
-    busy.start('Сборка…');
-    try {
-      const result = await api.assemble(projectId);
-      await reload();
-      openAssemblyResult(result);
-      toast('Промт собран, версия сохранена', 'ok');
-    } catch (error) {
-      toast(errorMessage(error), 'error');
-    } finally {
-      busy.stop();
-    }
+  /**
+   * Завершение интервью одним действием.
+   *
+   * Порядок соответствует требованиям продукта: анализ собранных материалов →
+   * подбор стандартов и похожих примеров → сборка промта из этих материалов.
+   * Прогресс показывается по шагам, а не «крутилкой без объяснений».
+   */
+  async function finishProject() {
+    if (streaming) return;
+    streaming = true;
+    renderSections();
+    renderChat();
+
+    const log = h('div', { class: 'stack gap-8' });
+    const counter = h('div', { class: 'faint', style: { fontSize: '11.5px' } }, 'Подготовка…');
+    const list = h('div', { class: 'stack gap-4' });
+    log.append(counter, list);
+
+    const dialog = openModal({
+      title: 'Сборка промта из материалов интервью',
+      body: h(
+        'div',
+        { class: 'stack gap-12' },
+        h(
+          'p',
+          { class: 'muted', style: { margin: '0', fontSize: '12.5px' } },
+          'Разделы собираются по очереди: анализ материалов, подбор профессиональных требований и примеров, затем итоговый промт.',
+        ),
+        log,
+      ),
+      footer: h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onclick: () => dialog.close() }, 'Закрыть')),
+      width: '620px',
+    });
+
+    let done = 0;
+    let skipped = 0;
+    let finalResult = null;
+
+    streamProjectFinish(projectId, {
+      onEvent(event) {
+        if (event.type === 'start') {
+          counter.textContent = 'Анализ материалов…';
+          return;
+        }
+        if (event.type === 'done') {
+          counter.textContent = `Готово: ${event.sections?.length ?? 0} разделов, оценка ${event.quality?.total ?? '—'}`;
+          finalResult = event;
+          return;
+        }
+        if (event.type !== 'progress') return;
+
+        if (event.kind === 'skip' || event.kind === 'sectionError') skipped += 1;
+        if (event.kind === 'section' || event.kind === 'sectionError') {
+          done += 1;
+          counter.textContent = `Обработано разделов: ${done} из ${data.sections.length}`;
+        }
+        list.append(
+          h(
+            'div',
+            { class: 'step', dataset: { status: event.kind === 'sectionError' || event.kind === 'skip' ? 'skipped' : 'ok' } },
+            h('span', { class: 'marker' }, event.kind === 'sectionError' || event.kind === 'skip' ? '!' : '✓'),
+            ` ${event.message}`,
+          ),
+        );
+      },
+      async onDone() {
+        streaming = false;
+        await reload();
+        dialog.close();
+        if (finalResult?.prompt) openAssemblyResult(finalResult);
+        toast(
+          skipped > 0 ? `Промт собран, часть разделов пропущена: ${skipped}` : 'Промт собран из материалов интервью',
+          skipped > 0 ? 'warn' : 'ok',
+        );
+      },
+      onError(error) {
+        streaming = false;
+        list.append(h('div', { class: 'status-line', dataset: { tone: 'error' } }, `Ошибка: ${error.message}`));
+        void reload();
+      },
+    });
   }
+
+  /* ─────────────────────────── Сборка ─────────────────────────── */
 
   function openAssemblyResult(result) {
     const promptBox = h('div', { class: 'draft-box', style: { maxHeight: '300px' } }, result.prompt);

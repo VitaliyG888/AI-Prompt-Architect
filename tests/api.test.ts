@@ -570,10 +570,11 @@ test('pipeline: NDJSON-поток отдаёт start → step → section → do
   assert.equal(events[events.length - 1].type, 'done');
 
   // Синтез без настроенного провайдера не падает: раздел собирается
-  // детерминированно из требований и честно помечается как незавершённый.
+  // детерминированно из требований и остаётся рабочим, а не уходит в тупик
+  // «требует пересмотра», из которого некуда идти.
   const section = events.find((event) => event.type === 'section');
   assert.ok(section, 'нет события section');
-  assert.equal((section.section as Record<string, unknown>).status, 'needs_revision');
+  assert.equal((section.section as Record<string, unknown>).status, 'ready_for_synthesis');
   // Исследование без поискового провайдера не выдумывает источники.
   const research = events.find((event) => event.type === 'research');
   assert.ok(research, 'нет события research');
@@ -606,4 +607,97 @@ test('usage: сводка и события доступны и пусты на 
   const summary = result.json.summary as Record<string, unknown>;
   assert.ok(summary);
   assert.deepEqual(result.json.events, []);
+});
+
+/* ─────────────────────────── Стандарты и библиотека ─────────────────────────── */
+
+test('skills: каталог отдаёт категории, разделы и чек-листы', async () => {
+  const result = await call('/api/skills');
+  assert.equal(result.status, 200);
+
+  const categories = result.json.categories as Array<{ key: string; label: string; count: number }>;
+  assert.ok(categories.length >= 3);
+  assert.ok(categories.every((category) => category.label.length > 0 && category.count > 0));
+
+  const skills = result.json.skills as Array<Record<string, unknown>>;
+  assert.ok(skills.length > 0);
+  assert.equal(result.json.total, skills.length);
+
+  const first = skills[0];
+  assert.ok(typeof first.id === 'string');
+  assert.ok(Array.isArray(first.guidance) && (first.guidance as unknown[]).length > 0);
+  assert.ok(Array.isArray(first.antiPatterns) && (first.antiPatterns as unknown[]).length > 0);
+  // Раздел отдаётся парой ключ/заголовок, чтобы интерфейс не дублировал словарь.
+  const sections = first.sections as Array<{ key: string; title: string }>;
+  assert.ok(sections.every((section) => section.key && section.title));
+
+  // Фильтр по категории не смешивает категории.
+  const category = categories[0].key;
+  const filtered = await call(`/api/skills?category=${encodeURIComponent(category)}`);
+  assert.equal(filtered.status, 200);
+  assert.ok((filtered.json.skills as Array<{ category: string }>).every((skill) => skill.category === category));
+
+  // Неизвестная категория — ошибка валидации, а не пустой список.
+  const unknown = await call('/api/skills?category=nope');
+  assert.equal(unknown.status, 422);
+  assert.equal(errorCode(unknown), 'VALIDATION_FAILED');
+});
+
+test('skills: предпросмотр подбора объясняет выбор', async () => {
+  const idea = 'Нужен лендинг для салона красоты с записью онлайн';
+  const result = await call(`/api/skills/selection?idea=${encodeURIComponent(idea)}&section=context&limit=2`);
+  assert.equal(result.status, 200);
+
+  // Архетип определяется по идее: сайт, а не маркетинг.
+  assert.equal(result.json.archetype, 'site_builder');
+  assert.deepEqual(result.json.section, { key: 'context', title: 'CONTEXT — Контекст' });
+
+  const selection = result.json.selection as Array<Record<string, unknown>>;
+  assert.ok(selection.length > 0 && selection.length <= 2);
+  for (const entry of selection) {
+    assert.ok(typeof entry.id === 'string');
+    assert.ok(typeof entry.score === 'number');
+    assert.ok(Array.isArray(entry.reasons) && (entry.reasons as unknown[]).length > 0);
+    assert.ok(typeof entry.categoryLabel === 'string');
+  }
+
+  // Без идеи подбор невозможен — честная ошибка, а не пустой результат.
+  assert.equal((await call('/api/skills/selection')).status, 422);
+  // Неизвестный раздел отсекается валидацией.
+  const badSection = await call(`/api/skills/selection?idea=${encodeURIComponent(idea)}&section=nope`);
+  assert.equal(badSection.status, 422);
+});
+
+test('library: каталог без тел, пример целиком по id', async () => {
+  const index = await call('/api/library');
+  assert.equal(index.status, 200);
+
+  const counts = index.json.counts as { categories: number; prompts: number };
+  assert.ok(counts.prompts > 0);
+  assert.equal(index.json.total, counts.prompts);
+
+  const categories = index.json.categories as Array<{ slug: string; count: number }>;
+  assert.equal(categories.length, counts.categories);
+  assert.ok(categories.every((category) => category.count > 0));
+
+  const items = index.json.items as Array<Record<string, unknown>>;
+  assert.ok(items.length > 0);
+  // Каталог намеренно лёгкий: тела отдаются отдельным запросом.
+  assert.equal(items[0].body, undefined);
+  assert.ok(typeof items[0].id === 'string');
+  assert.ok(typeof items[0].chars === 'number');
+
+  const prompt = await call(`/api/library/${encodeURIComponent(String(items[0].id))}`);
+  assert.equal(prompt.status, 200);
+  const body = (prompt.json.prompt as Record<string, unknown>).body;
+  assert.ok(typeof body === 'string' && (body as string).length > 0);
+
+  // Тела можно получить сразу — явным флагом.
+  const withBodies = await call('/api/library?bodies=1&limit=1');
+  assert.equal(withBodies.status, 200);
+  assert.ok(typeof (withBodies.json.items as Array<Record<string, unknown>>)[0].body === 'string');
+
+  const missing = await call('/api/library/no-such-example');
+  assert.equal(missing.status, 404);
+  assert.equal(errorCode(missing), 'NOT_FOUND');
 });
